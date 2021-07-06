@@ -549,6 +549,28 @@ void ULuaState::FromLuaValue(FLuaValue& LuaValue, UObject* CallContext, lua_Stat
 		}
 		if (CallContext)
 		{
+			// --- CI ---
+			// try to call on component first ---
+			{
+				UFunction* Function = CallContext->FindFunction(LuaValue.FunctionName);
+				if (Function)
+				{
+					// cache it for context-less calls
+					LuaValue.Object = CallContext;
+					FLuaUserData* LuaCallContext = (FLuaUserData*)lua_newuserdata(State, sizeof(FLuaUserData));
+					LuaCallContext->Type = ELuaValueType::UFunction;
+					LuaCallContext->Context = CallContext;
+					LuaCallContext->Function = Function;
+					lua_newtable(State);
+					lua_pushcfunction(State, bRawLuaFunctionCall ? ULuaState::MetaTableFunction__rawcall : ULuaState::MetaTableFunction__call);
+					lua_setfield(State, -2, "__call");
+					lua_setmetatable(State, -2);
+					return;
+				}
+			}
+			
+			// --- CI ----
+			
 			UObject* FunctionOwner = CallContext;
 			if (ULuaComponent* LuaComponent = Cast<ULuaComponent>(CallContext))
 			{
