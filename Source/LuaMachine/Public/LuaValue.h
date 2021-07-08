@@ -52,6 +52,10 @@ struct LUAMACHINE_API FLuaValue
 
 	FLuaValue(const FLuaValue& SourceValue);
 	FLuaValue& operator = (const FLuaValue &SourceValue);
+	FORCEINLINE bool IsIntOrNumber()
+	{
+		return Type == ELuaValueType::Integer || Type == ELuaValueType::Number;
+	}
 
 	FLuaValue(const FString& InString) : FLuaValue()
 	{
