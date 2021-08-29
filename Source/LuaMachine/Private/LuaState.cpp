@@ -6,6 +6,7 @@
 #include "LuaMachine.h"
 #include "LuaBlueprintPackage.h"
 #include "LuaBlueprintFunctionLibrary.h"
+#include "AssetRegistryModule.h"
 #include "GameFramework/Actor.h"
 #include "Runtime/Core/Public/Misc/FileHelper.h"
 #include "Runtime/Core/Public/Misc/Paths.h"
@@ -40,12 +41,16 @@ ULuaState* ULuaState::GetLuaState(UWorld* InWorld)
 	}
 
 	if (bDisabled)
+	{
 		return nullptr;
+	}
 
 	L = luaL_newstate();
 
 	if (bLuaOpenLibs)
+	{
 		luaL_openlibs(L);
+	}
 
 	ULuaState** LuaExtraSpacePtr = (ULuaState**)lua_getextraspace(L);
 	*LuaExtraSpacePtr = this;
@@ -56,11 +61,11 @@ ULuaState* ULuaState::GetLuaState(UWorld* InWorld)
 	SetField(-2, "print");
 
 	// load "package" for allowing minimal setup
+	luaL_requiref(L, "package", luaopen_package, 1);
+	lua_pop(L, 1);
+
 	if (!bLuaOpenLibs)
 	{
-		luaL_requiref(L, "package", luaopen_package, 1);
-		lua_pop(L, 1);
-
 		if (LuaLibsLoader.bLoadBase)
 		{
 			luaL_requiref(L, "_G", luaopen_base, 1);
@@ -172,7 +177,16 @@ ULuaState* ULuaState::GetLuaState(UWorld* InWorld)
 		SetField(-2, TCHAR_TO_ANSI(*Pair.Key));
 	}
 
-	// pop package.preload
+	// pop package.prelod
+	Pop(1);
+
+	// manage searchers
+	GetField(-1, "searchers");
+	PushCFunction(ULuaState::TableFunction_package_loader);
+	constexpr int PackageLoadersFirstAvailableIndex = 5;
+	lua_seti(L, -2, PackageLoadersFirstAvailableIndex);
+
+	// pop package.searchers (and package)
 	Pop(2);
 
 
@@ -1348,6 +1362,103 @@ int ULuaState::TableFunction_print(lua_State * L)
 	return 0;
 }
 
+int ULuaState::TableFunction_package_loader_codeasset(lua_State * L)
+{
+	ULuaState* LuaState = ULuaState::GetFromExtraSpace(L);
+
+	// use the second (sanitized by the loader) argument
+	FString Key = ANSI_TO_TCHAR(lua_tostring(L, 2));
+
+	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+	FAssetData AssetData = AssetRegistryModule.Get().GetAssetByObjectPath(*Key);
+	if (AssetData.IsValid() && AssetData.AssetClass == "LuaCode")
+	{
+		ULuaCode* LuaCode = Cast<ULuaCode>(AssetData.GetAsset());
+		if (LuaCode)
+		{
+			if (!LuaState->RunCodeAsset(LuaCode, 1))
+			{
+				return luaL_error(L, "%s", lua_tostring(L, -1));
+			}
+			return 1;
+		}
+	}
+
+	return luaL_error(L, "unable to load asset '%s'", TCHAR_TO_UTF8(*Key));
+}
+
+int ULuaState::TableFunction_package_loader_asset(lua_State * L)
+{
+	ULuaState* LuaState = ULuaState::GetFromExtraSpace(L);
+
+	// use the second (sanitized by the loader) argument
+	const FString Key = ANSI_TO_TCHAR(lua_tostring(L, 2));
+
+	if (LuaState->RunFile(Key, true, 1))
+	{
+		return 1;
+	}
+	return luaL_error(L, "%s", lua_tostring(L, -1));
+}
+
+int ULuaState::TableFunction_package_loader(lua_State * L)
+{
+	ULuaState* LuaState = ULuaState::GetFromExtraSpace(L);
+
+	FString Key = ANSI_TO_TCHAR(lua_tostring(L, 1));
+
+	// check for code assets
+	if (FPackageName::IsValidObjectPath(Key))
+	{
+		// fix asset name (if required)
+		int32 LastSlashIndex = -1;
+		Key.FindLastChar('/', LastSlashIndex);
+		const FString LastPart = Key.RightChop(LastSlashIndex + 1);
+		if (!LastPart.Contains("."))
+		{
+			Key = FString::Printf(TEXT("%s.%s"), *Key, *LastPart);
+		}
+
+		lua_pushcfunction(L, ULuaState::TableFunction_package_loader_codeasset);
+		lua_pushstring(L, TCHAR_TO_UTF8(*Key));
+		return 2;
+	}
+	else
+	{
+		// TODO: make it smarter by checking for file extension...
+		if (!Key.EndsWith(".lua"))
+		{
+			Key += ".lua";
+		}
+		// search in root content...
+		FString AbsoluteFilename = FPaths::Combine(FPaths::ProjectContentDir(), Key);
+		if (FPaths::FileExists(AbsoluteFilename))
+		{
+			lua_pushcfunction(L, ULuaState::TableFunction_package_loader_asset);
+			lua_pushstring(L, TCHAR_TO_UTF8(*Key));
+			return 2;
+		}
+		else
+		{
+			// or search in additional paths
+			for (FString AdditionalPath : LuaState->AppendProjectContentDirSubDir)
+			{
+				AbsoluteFilename = FPaths::Combine(FPaths::ProjectContentDir(), AdditionalPath, Key);
+				if (FPaths::FileExists(AbsoluteFilename))
+				{
+					lua_pushcfunction(L, ULuaState::TableFunction_package_loader_asset);
+					lua_pushstring(L, TCHAR_TO_UTF8(*(AdditionalPath / Key)));
+					return 2;
+				}
+			}
+		}
+	}
+
+	// use UTF8 as the package name can contains non-ASCII chars
+	lua_pushstring(L, TCHAR_TO_UTF8(*FString::Printf(TEXT("\n\tno asset '%s'"), *Key)));
+	return 1;
+}
+
 int ULuaState::TableFunction_package_preload(lua_State * L)
 {
 	ULuaState* LuaState = ULuaState::GetFromExtraSpace(L);
@@ -1541,7 +1652,7 @@ void ULuaState::SetFieldFromTree(const FString & Tree, FLuaValue & Value, bool b
 }
 
 
-void ULuaState::NewUObject(UObject * Object, lua_State* State)
+void ULuaState::NewUObject(UObject * Object, lua_State * State)
 {
 	if (!State)
 	{
@@ -1864,7 +1975,7 @@ ULuaState::~ULuaState()
 	}
 #endif
 
-#if ENGINE_MINOR_VERSION >= 25
+#if	ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 FLuaValue ULuaState::FromUProperty(void* Buffer, FProperty * Property, bool& bSuccess, int32 Index)
 {
 	return FromFProperty(Buffer, Property, bSuccess, Index);
@@ -1875,7 +1986,7 @@ void ULuaState::ToUProperty(void* Buffer, FProperty * Property, FLuaValue Value,
 }
 #endif
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 FLuaValue ULuaState::FromFProperty(void* Buffer, FProperty * Property, bool& bSuccess, int32 Index)
 #else
 FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty * Property, bool& bSuccess, int32 Index)
@@ -1899,7 +2010,7 @@ FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty * Property, bool& bSu
 	LUAVALUE_PROP_CAST(ClassProperty, UObject*);
 	LUAVALUE_PROP_CAST(ObjectProperty, UObject*);
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	FEnumProperty* EnumProperty = CastField<FEnumProperty>(Property);
 
 	if (EnumProperty)
@@ -1909,7 +2020,7 @@ FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty * Property, bool& bSu
 	}
 #endif
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	FObjectPropertyBase* ObjectPropertyBase = CastField<FObjectPropertyBase>(Property);
 #else
 	UObjectPropertyBase* ObjectPropertyBase = Cast<UObjectPropertyBase>(Property);
@@ -1919,7 +2030,7 @@ FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty * Property, bool& bSu
 		return FLuaValue(ObjectPropertyBase->GetObjectPropertyValue_InContainer(Buffer, Index));
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	FWeakObjectProperty* WeakObjectProperty = CastField<FWeakObjectProperty>(Property);
 #else
 	UWeakObjectProperty* WeakObjectProperty = Cast<UWeakObjectProperty>(Property);
@@ -1930,7 +2041,7 @@ FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty * Property, bool& bSu
 		return FLuaValue(WeakPtr.Get());
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	if (FMulticastDelegateProperty* MulticastProperty = CastField<FMulticastDelegateProperty>(Property))
 #else
 	if (UMulticastDelegateProperty* MulticastProperty = Cast<UMulticastDelegateProperty>(Property))
@@ -1941,7 +2052,7 @@ FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty * Property, bool& bSu
 		return CreateLuaTable();
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	if (FDelegateProperty* DelegateProperty = CastField<FDelegateProperty>(Property))
 #else
 	if (UDelegateProperty* DelegateProperty = Cast<UDelegateProperty>(Property))
@@ -1951,7 +2062,7 @@ FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty * Property, bool& bSu
 		return FLuaValue::FunctionOfObject((UObject*)ScriptDelegate.GetUObject(), ScriptDelegate.GetFunctionName());
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	if (FArrayProperty* ArrayProperty = CastField<FArrayProperty>(Property))
 #else
 	if (UArrayProperty* ArrayProperty = Cast<UArrayProperty>(Property))
@@ -1968,7 +2079,7 @@ FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty * Property, bool& bSu
 		return NewLuaArray;
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	if (FMapProperty* MapProperty = CastField<FMapProperty>(Property))
 #else
 	if (UMapProperty* MapProperty = Cast<UMapProperty>(Property))
@@ -1988,7 +2099,7 @@ FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty * Property, bool& bSu
 		return NewLuaTable;
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	if (FSetProperty* SetProperty = CastField<FSetProperty>(Property))
 #else
 	if (USetProperty* SetProperty = Cast<USetProperty>(Property))
@@ -2005,7 +2116,7 @@ FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty * Property, bool& bSu
 		return NewLuaArray;
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	if (FStructProperty* StructProperty = CastField<FStructProperty>(Property))
 #else
 	if (UStructProperty* StructProperty = Cast<UStructProperty>(Property))
@@ -2030,16 +2141,16 @@ FLuaValue ULuaState::FromUProperty(void* Buffer, UProperty * Property, bool& bSu
 	return FLuaValue();
 }
 
-FLuaValue ULuaState::StructToLuaTable(UScriptStruct* InScriptStruct, const uint8* StructData)
+FLuaValue ULuaState::StructToLuaTable(UScriptStruct * InScriptStruct, const uint8 * StructData)
 {
 	FLuaValue NewLuaTable = CreateLuaTable();
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	for (TFieldIterator<FProperty> It(InScriptStruct); It; ++It)
 #else
 	for (TFieldIterator<UProperty> It(InScriptStruct); It; ++It)
 #endif
 	{
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 		FProperty* FieldProp = *It;
 #else
 		UProperty* FieldProp = *It;
@@ -2051,12 +2162,12 @@ FLuaValue ULuaState::StructToLuaTable(UScriptStruct* InScriptStruct, const uint8
 	return NewLuaTable;
 }
 
-FLuaValue ULuaState::StructToLuaTable(UScriptStruct* InScriptStruct, const TArray<uint8>& StructData)
+FLuaValue ULuaState::StructToLuaTable(UScriptStruct * InScriptStruct, const TArray<uint8>&StructData)
 {
 	return StructToLuaTable(InScriptStruct, StructData.GetData());
 }
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 void ULuaState::ToFProperty(void* Buffer, FProperty * Property, FLuaValue Value, bool& bSuccess, int32 Index)
 #else
 void ULuaState::ToUProperty(void* Buffer, UProperty * Property, FLuaValue Value, bool& bSuccess, int32 Index)
@@ -2080,7 +2191,7 @@ void ULuaState::ToUProperty(void* Buffer, UProperty * Property, FLuaValue Value,
 	LUAVALUE_PROP_SET(ClassProperty, Value.Object);
 	LUAVALUE_PROP_SET(ObjectProperty, Value.Object);
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	FObjectPropertyBase* ObjectPropertyBase = CastField<FObjectPropertyBase>(Property);
 #else
 	UObjectPropertyBase* ObjectPropertyBase = Cast<UObjectPropertyBase>(Property);
@@ -2090,7 +2201,7 @@ void ULuaState::ToUProperty(void* Buffer, UProperty * Property, FLuaValue Value,
 		ObjectPropertyBase->SetObjectPropertyValue_InContainer(Buffer, Value.Object, Index);
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	FWeakObjectProperty* WeakObjectProperty = CastField<FWeakObjectProperty>(Property);
 #else
 	UWeakObjectProperty* WeakObjectProperty = Cast<UWeakObjectProperty>(Property);
@@ -2102,7 +2213,7 @@ void ULuaState::ToUProperty(void* Buffer, UProperty * Property, FLuaValue Value,
 		return;
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	if (FMulticastDelegateProperty* MulticastProperty = CastField<FMulticastDelegateProperty>(Property))
 #else
 	if (UMulticastDelegateProperty* MulticastProperty = Cast<UMulticastDelegateProperty>(Property))
@@ -2119,7 +2230,7 @@ void ULuaState::ToUProperty(void* Buffer, UProperty * Property, FLuaValue Value,
 		return;
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	if (FDelegateProperty* DelegateProperty = CastField<FDelegateProperty>(Property))
 #else
 	if (UDelegateProperty* DelegateProperty = Cast<UDelegateProperty>(Property))
@@ -2136,7 +2247,7 @@ void ULuaState::ToUProperty(void* Buffer, UProperty * Property, FLuaValue Value,
 		return;
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	if (FStructProperty* StructProperty = CastField<FStructProperty>(Property))
 #else
 	if (UStructProperty* StructProperty = Cast<UStructProperty>(Property))
@@ -2155,7 +2266,7 @@ void ULuaState::ToUProperty(void* Buffer, UProperty * Property, FLuaValue Value,
 		return;
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	if (FArrayProperty* ArrayProperty = CastField<FArrayProperty>(Property))
 #else
 	if (UArrayProperty* ArrayProperty = Cast<UArrayProperty>(Property))
@@ -2173,7 +2284,7 @@ void ULuaState::ToUProperty(void* Buffer, UProperty * Property, FLuaValue Value,
 		return;
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	if (FMapProperty* MapProperty = CastField<FMapProperty>(Property))
 #else
 	if (UMapProperty* MapProperty = Cast<UMapProperty>(Property))
@@ -2195,7 +2306,7 @@ void ULuaState::ToUProperty(void* Buffer, UProperty * Property, FLuaValue Value,
 		return;
 	}
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	if (FSetProperty* SetProperty = CastField<FSetProperty>(Property))
 #else
 	if (USetProperty* SetProperty = Cast<USetProperty>(Property))
@@ -2216,12 +2327,12 @@ void ULuaState::ToUProperty(void* Buffer, UProperty * Property, FLuaValue Value,
 	bSuccess = false;
 }
 
-void ULuaState::LuaTableToStruct(FLuaValue& LuaValue, UScriptStruct* InScriptStruct, uint8* StructData)
+void ULuaState::LuaTableToStruct(FLuaValue & LuaValue, UScriptStruct * InScriptStruct, uint8 * StructData)
 {
 	TArray<FLuaValue> TableKeys = ULuaBlueprintFunctionLibrary::LuaTableGetKeys(LuaValue);
 	for (FLuaValue TableKey : TableKeys)
 	{
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 		FProperty* StructProp = InScriptStruct->FindPropertyByName(TableKey.ToName());
 #else
 		UProperty* StructProp = InScriptStruct->FindPropertyByName(TableKey.ToName());
@@ -2234,7 +2345,7 @@ void ULuaState::LuaTableToStruct(FLuaValue& LuaValue, UScriptStruct* InScriptStr
 	}
 }
 
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 void ULuaState::ToProperty(void* Buffer, FProperty * Property, FLuaValue Value, bool& bSuccess, int32 Index)
 {
 	ToFProperty(Buffer, Property, Value, bSuccess, Index);
@@ -2264,7 +2375,7 @@ FLuaValue ULuaState::GetLuaValueFromProperty(UObject * InObject, const FString &
 	}
 
 	UClass* Class = InObject->GetClass();
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	FProperty* Property = nullptr;
 #else
 	UProperty* Property = nullptr;
@@ -2287,7 +2398,7 @@ bool ULuaState::SetPropertyFromLuaValue(UObject * InObject, const FString & Prop
 	}
 
 	UClass* Class = InObject->GetClass();
-#if ENGINE_MINOR_VERSION >= 25
+#if ENGINE_MAJOR_VERSION > 4 || ENGINE_MINOR_VERSION >= 25
 	FProperty* Property = nullptr;
 #else
 	UProperty* Property = nullptr;
@@ -2308,7 +2419,7 @@ void ULuaState::SetUserDataMetaTable(FLuaValue MetaTable)
 	UserDataMetaTable = MetaTable;
 }
 
-void ULuaState::SetupAndAssignUserDataMetatable(UObject* Context, TMap<FString, FLuaValue>& Metatable, lua_State* State)
+void ULuaState::SetupAndAssignUserDataMetatable(UObject * Context, TMap<FString, FLuaValue>&Metatable, lua_State * State)
 {
 	if (!State)
 	{
